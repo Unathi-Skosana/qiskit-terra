@@ -17,6 +17,10 @@ import os
 
 import csv
 import numpy as np
+from qiskit.utils.validation import (
+    validate_min,
+    validate_range_exclusive_max,
+)
 from qiskit.utils.deprecation import deprecate_arguments
 from .optimizer import Optimizer, OptimizerSupportLevel, OptimizerResult, POINT
 
@@ -24,7 +28,7 @@ from .optimizer import Optimizer, OptimizerSupportLevel, OptimizerResult, POINT
 
 
 class ADAM(Optimizer):
-    """Adam and AMSGRAD optimizers.
+    """Adam, RAdam and AMSGRAD optimizers.
 
     Adam [1] is a gradient-based optimization algorithm that is relies on adaptive estimates of
     lower-order moments. The algorithm requires little memory and is invariant to diagonal
@@ -34,7 +38,8 @@ class ADAM(Optimizer):
     AMSGRAD [2] (a variant of Adam) uses a 'long-term memory' of past gradients and, thereby,
     improves convergence properties.
 
-    RAdam [3]
+    RAdam [3] (a variant of Adam) introduces a extra term to rectify the variance of the adaptive
+    learning rate.
 
     References:
 
@@ -101,10 +106,20 @@ class ADAM(Optimizer):
             snapshot_dir: If not None save the optimizer's parameter
                 after every step to the given directory
         """
+
+        validate_min("tol", tol, 1e-15)
+        validate_min("eps", eps, 1e-15)
+        validate_min("noise_factor", noise_factor, 1e-15)
+        validate_min("weight_decay", weight_decay, 0.0)
+
+        validate_range_exclusive_max("beta_1", beta_1, 0, 1)
+        validate_range_exclusive_max("beta_2", beta_2, 0, 1)
+
         super().__init__()
         for k, v in list(locals().items()):
             if k in self._OPTIONS:
                 self._options[k] = v
+
         self._maxiter = maxiter
         self._snapshot_dir = snapshot_dir
         self._tol = tol
@@ -261,8 +276,8 @@ class ADAM(Optimizer):
 
             m_scaled_g_values = (1 - self._beta_1) * derivative
             v_scaled_g_values = (1 - self._beta_2) * (derivative * derivative)
-            beta_1_t_power = self._beta_1 ** self._t
-            beta_2_t_power = self._beta_2 ** self._t
+            beta_1_t_power = self._beta_1**self._t
+            beta_2_t_power = self._beta_2**self._t
 
             self._m = self._beta_1 * self._m + m_scaled_g_values
             self._v = self._beta_2 * self._v + v_scaled_g_values
@@ -270,8 +285,15 @@ class ADAM(Optimizer):
             if self._radam:
                 sma_inf = 2.0 / (1.0 - self._beta_2) - 1.0
                 sma_t = sma_inf - 2.0 * self._t * beta_2_t_power / (1.0 - beta_2_t_power)
-                m_corr_t  = self._m / (1.0 - beta_1_t_power)
-                r_t = np.sqrt((sma_t - 4.0) / (sma_inf - 4.0) * (sma_t - 2.0) / (sma_inf - 2.0) * sma_inf / sma_t)
+                m_corr_t = self._m / (1.0 - beta_1_t_power)
+                r_t = np.sqrt(
+                    (sma_t - 4.0)
+                    / (sma_inf - 4.0)
+                    * (sma_t - 2.0)
+                    / (sma_inf - 2.0)
+                    * sma_inf
+                    / sma_t
+                )
 
                 if self._amsgrad:
                     self._v_eff = np.maximum(self._v_eff, self._v)
@@ -282,7 +304,7 @@ class ADAM(Optimizer):
                 var_t = np.where(sma_t >= 5.0, r_t * m_corr_t / (v_corr_t + self._eps), m_corr_t)
 
                 if self._weight_decay > 0.0:
-                    var_t += self._weight_decay  * params
+                    var_t += self._weight_decay * params
 
                 params_new = params - self._lr * var_t
             else:
