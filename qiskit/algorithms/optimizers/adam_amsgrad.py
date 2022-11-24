@@ -10,7 +10,7 @@
 # copyright notice, and modified files need to carry a notice indicating
 # that they have been altered from the originals.
 
-"""The Adam and AMSGRAD optimizers."""
+"""The Adam, RAdam and AMSGRAD optimizers."""
 
 from typing import Any, Optional, Callable, Dict, Tuple, List
 import os
@@ -34,6 +34,8 @@ class ADAM(Optimizer):
     AMSGRAD [2] (a variant of Adam) uses a 'long-term memory' of past gradients and, thereby,
     improves convergence properties.
 
+    RAdam [3]
+
     References:
 
         [1]: Kingma, Diederik & Ba, Jimmy (2014), Adam: A Method for Stochastic Optimization.
@@ -42,6 +44,10 @@ class ADAM(Optimizer):
         [2]: Sashank J. Reddi and Satyen Kale and Sanjiv Kumar (2018),
              On the Convergence of Adam and Beyond.
              `arXiv:1904.09237 <https://arxiv.org/abs/1904.09237>`_
+
+        [3]: Liyuan Liu and Haoming Jiang and Pengcheng He and Weizhu Chen and Xiaodong Liu and Jianfeng Gao and Jiawei Han (2020),
+             On the Variance of the Adaptive Learning Rate and Beyond.
+             `arXiv:1908.03265 <https://arxiv.org/abs/1908.0326>`_
 
     .. note::
 
@@ -60,6 +66,8 @@ class ADAM(Optimizer):
         "noise_factor",
         "eps",
         "amsgrad",
+        "radam",
+        "weight_decay",
         "snapshot_dir",
     ]
 
@@ -71,8 +79,10 @@ class ADAM(Optimizer):
         beta_1: float = 0.9,
         beta_2: float = 0.99,
         noise_factor: float = 1e-8,
-        eps: float = 1e-10,
+        eps: float = 1e-8,
+        weight_decay: float = 0.0,
         amsgrad: bool = False,
+        radam: bool = False,
         snapshot_dir: Optional[str] = None,
     ) -> None:
         """
@@ -85,7 +95,9 @@ class ADAM(Optimizer):
             noise_factor: Value >= 0, Noise factor
             eps : Value >=0, Epsilon to be used for finite differences if no analytic
                 gradient method is given.
+            weight_decay: Weight decay for each param
             amsgrad: True to use AMSGRAD, False if not
+            radam: True to use RAdam, False if not
             snapshot_dir: If not None save the optimizer's parameter
                 after every step to the given directory
         """
@@ -99,9 +111,11 @@ class ADAM(Optimizer):
         self._lr = lr
         self._beta_1 = beta_1
         self._beta_2 = beta_2
+        self._weight_decay = weight_decay
         self._noise_factor = noise_factor
         self._eps = eps
         self._amsgrad = amsgrad
+        self._radam = radam
 
         # runtime variables
         self._t = 0  # time steps
@@ -244,18 +258,44 @@ class ADAM(Optimizer):
             if self._t > 0:
                 derivative = jac(params)
             self._t += 1
-            self._m = self._beta_1 * self._m + (1 - self._beta_1) * derivative
-            self._v = self._beta_2 * self._v + (1 - self._beta_2) * derivative * derivative
-            lr_eff = self._lr * np.sqrt(1 - self._beta_2**self._t) / (1 - self._beta_1**self._t)
-            if not self._amsgrad:
-                params_new = params - lr_eff * self._m.flatten() / (
-                    np.sqrt(self._v.flatten()) + self._noise_factor
-                )
+
+            m_scaled_g_values = (1 - self._beta_1) * derivative
+            v_scaled_g_values = (1 - self._beta_2) * (derivative * derivative)
+            beta_1_t_power = self._beta_1 ** self._t
+            beta_2_t_power = self._beta_2 ** self._t
+
+            self._m = self._beta_1 * self._m + m_scaled_g_values
+            self._v = self._beta_2 * self._v + v_scaled_g_values
+
+            if self._radam:
+                sma_inf = 2.0 / (1.0 - self._beta_2) - 1.0
+                sma_t = sma_inf - 2.0 * self._t * beta_2_t_power / (1.0 - beta_2_t_power)
+                m_corr_t  = self._m / (1.0 - beta_1_t_power)
+                r_t = np.sqrt((sma_t - 4.0) / (sma_inf - 4.0) * (sma_t - 2.0) / (sma_inf - 2.0) * sma_inf / sma_t)
+
+                if self._amsgrad:
+                    self._v_eff = np.maximum(self._v_eff, self._v)
+                    v_corr_t = np.sqrt(self._v_eff / (1.0 - beta_2_t_power))
+                else:
+                    v_corr_t = np.sqrt(self._v / (1.0 - beta_2_t_power))
+
+                var_t = np.where(sma_t >= 5.0, r_t * m_corr_t / (v_corr_t + self._eps), m_corr_t)
+
+                if self._weight_decay > 0.0:
+                    var_t += self._weight_decay  * params
+
+                params_new = params - self._lr * var_t
             else:
-                self._v_eff = np.maximum(self._v_eff, self._v)
-                params_new = params - lr_eff * self._m.flatten() / (
-                    np.sqrt(self._v_eff.flatten()) + self._noise_factor
-                )
+                lr_eff = self._lr * np.sqrt((1.0 - beta_2_t_power) / (1.0 - beta_1_t_power))
+                if self._amsgrad:
+                    self._v_eff = np.maximum(self._v_eff, self._v)
+                    params_new = params - lr_eff * self._m.flatten() / (
+                        np.sqrt(self._v_eff.flatten()) + self._noise_factor
+                    )
+                else:
+                    params_new = params - lr_eff * self._m.flatten() / (
+                        np.sqrt(self._v.flatten()) + self._noise_factor
+                    )
 
             if self._snapshot_dir:
                 self.save_params(self._snapshot_dir)
